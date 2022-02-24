@@ -1,0 +1,6 @@
+boto3==1.9.216
+ask-sdk
+ask-sdk-core>=1.11.0
+ask-sdk-dynamodb-persistence-adapter>=1.15.0
+Pyrogram>=1.4.7
+TgCrypto>=1.2.3
