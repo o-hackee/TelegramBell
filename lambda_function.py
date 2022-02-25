@@ -8,37 +8,143 @@ import logging
 import os
 
 from ask_sdk.standard import StandardSkillBuilder
-from ask_sdk_core.dispatch_components import AbstractRequestHandler
+from ask_sdk_core.dispatch_components import AbstractRequestHandler, AbstractRequestInterceptor, \
+    AbstractResponseInterceptor
 from ask_sdk_core.dispatch_components import AbstractExceptionHandler
-from ask_sdk_core.dispatch_components import AbstractRequestInterceptor
-from ask_sdk_core.dispatch_components import AbstractResponseInterceptor
 from ask_sdk_core.handler_input import HandlerInput
 import ask_sdk_core.utils as ask_utils
+from ask_sdk_model import Slot, Intent, Response
+from ask_sdk_model.dialog import ElicitSlotDirective
+from pyrogram.errors import PhoneNumberUnoccupied, PhoneCodeInvalid, PhoneCodeExpired
 
+from AlexaStorageHandler import AlexaStorageHandler
+from PyrogramClient import PyrogramClient
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO) # DEBUG for interceptors
 
 
 class LaunchRequestHandler(AbstractRequestHandler):
     """Handler for Skill Launch."""
     def can_handle(self, handler_input):
         # type: (HandlerInput) -> bool
-
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        session_attributes = handler_input.attributes_manager.session_attributes
-        session_attributes["visits"] = session_attributes["visits"] + 1
-        speak_output = f"Hi from Telegram Bell for the {session_attributes['visits']}th time"
+        pyrogram_client = PyrogramClient(AlexaStorageHandler(handler_input.attributes_manager))
 
+        if not pyrogram_client.get_is_authorized():
+            handler_input.attributes_manager.session_attributes["proposed_step"] = "setup"
+            speak_output = f"Hi from Telegram Bell. Let's setup your account. Are you ready?"
+            return (
+                handler_input.response_builder
+                    .speak(speak_output)
+                    .ask(speak_output)
+                    .response
+            )
+
+        speak_output = f"Hi from Telegram Bell!"
         return (
             handler_input.response_builder
                 .speak(speak_output)
                 .ask(speak_output)
                 .response
         )
+
+
+class YesIntentHandler(AbstractRequestHandler):
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return (
+            ask_utils.is_request_type("IntentRequest")(handler_input)
+            and ask_utils.is_intent_name("AMAZON.YesIntent")(handler_input)
+        )
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        session_attributes = handler_input.attributes_manager.session_attributes
+        if session_attributes.get("proposed_step") == "setup":
+            del session_attributes["proposed_step"]
+            slots = {"phoneNumber": Slot(name="phoneNumber")}
+            intent = Intent(name="PhoneNumberIntent", slots=slots)
+            speak_output = "What is your phone number?"
+            return (
+                handler_input.response_builder
+                    .speak(speak_output)
+                    .ask(speak_output)
+                .add_directive(ElicitSlotDirective(updated_intent=intent, slot_to_elicit="phoneNumber"))
+                    .response
+            )
+
+        return handler_input.response_builder.speak("Something went wrong. Please start a new session").response
+
+
+class PhoneNumberIntentHandler(AbstractRequestHandler):
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return (
+            ask_utils.is_request_type("IntentRequest")(handler_input)
+            and ask_utils.is_intent_name("PhoneNumberIntent")(handler_input)
+        )
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        phone_number = handler_input.request_envelope.request.intent.slots.get("phoneNumber").value
+
+        pyrogram_client = PyrogramClient(AlexaStorageHandler(handler_input.attributes_manager))
+        try:
+            phone_code_hash = pyrogram_client.send_code(phone_number)
+        except PhoneNumberUnoccupied:
+            return handler_input.response_builder.speak("This phone number is not registered in telegram").response
+
+        handler_input.attributes_manager.session_attributes["phone_number"] = phone_number
+        handler_input.attributes_manager.session_attributes["phone_code_hash"] = phone_code_hash
+        slots = {"code": Slot(name="code")}
+        intent = Intent(name="CodeIntent", slots=slots)
+        speak_output = "Please provide a code sent to your phone"
+        return (
+            handler_input.response_builder
+                .speak(speak_output)
+                .ask(speak_output)
+                .add_directive(ElicitSlotDirective(updated_intent=intent, slot_to_elicit="code"))
+                .response
+        )
+
+
+class CodeIntentHandler(AbstractRequestHandler):
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return (
+            ask_utils.is_request_type("IntentRequest")(handler_input)
+            and ask_utils.is_intent_name("CodeIntent")(handler_input)
+        )
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        code = handler_input.request_envelope.request.intent.slots.get("code").value
+        session_attributes = handler_input.attributes_manager.session_attributes
+
+        pyrogram_client = PyrogramClient(AlexaStorageHandler(handler_input.attributes_manager))
+        try:
+            pyrogram_client.sign_in(session_attributes["phone_number"], session_attributes["phone_code_hash"], code)
+        except PhoneCodeInvalid:
+            speak_output = "code is invalid"
+            return (
+                handler_input.response_builder
+                    .speak(speak_output)
+                    .ask(speak_output)
+                    .add_directive(ElicitSlotDirective(slot_to_elicit="code"))
+                    .response
+            )
+        except PhoneCodeExpired:
+            return handler_input.response_builder.speak("code expired").response
+        except Exception:
+            return CatchAllExceptionHandler().handle(handler_input, Exception("Exception during sign-in"))
+        return handler_input.response_builder.speak("all set up!").ask("what do you want to send?").response
 
 
 class LunchReadyIntentHandler(AbstractRequestHandler):
@@ -49,12 +155,15 @@ class LunchReadyIntentHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        speak_output = "Handling LunchReadyIntent"
+        pyrogram_client = PyrogramClient(AlexaStorageHandler(handler_input.attributes_manager))
+        send_ret = pyrogram_client.send_message("обед готов")
+        speak_output = "message is sent" if send_ret else "there was a problm sending a message"
 
         return (
             handler_input.response_builder
                 .speak(speak_output)
                 # .ask("add a reprompt if you want to keep the session open for the user to respond")
+                .set_should_end_session(True)
                 .response
         )
 
@@ -94,6 +203,7 @@ class CancelOrStopIntentHandler(AbstractRequestHandler):
                 .response
         )
 
+
 class FallbackIntentHandler(AbstractRequestHandler):
     """Single handler for Fallback Intent."""
     def can_handle(self, handler_input):
@@ -107,6 +217,7 @@ class FallbackIntentHandler(AbstractRequestHandler):
         reprompt = "I didn't catch that. What can I help you with?"
 
         return handler_input.response_builder.speak(speech).ask(reprompt).response
+
 
 class SessionEndedRequestHandler(AbstractRequestHandler):
     """Handler for Session End."""
@@ -168,25 +279,21 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
         )
 
 
-class LoadDataInterceptor(AbstractRequestInterceptor):
-    """Check if user is invoking skill for first time and initialize preset."""
+class LoggingRequestInterceptor(AbstractRequestInterceptor):
+    """Log the alexa requests."""
     def process(self, handler_input):
         # type: (HandlerInput) -> None
-        persistent_attributes = handler_input.attributes_manager.persistent_attributes
-        session_attributes = handler_input.attributes_manager.session_attributes
+        logger.debug('----- REQUEST -----')
+        logger.debug("{}".format(
+            handler_input.request_envelope.request))
 
-        session_attributes["visits"] = persistent_attributes["visits"] if 'visits' in persistent_attributes else 0
 
-
-class SaveDataInterceptor(AbstractResponseInterceptor):
-    """Save persistence attributes before sending response to user."""
+class LoggingResponseInterceptor(AbstractResponseInterceptor):
+    """Log the alexa responses."""
     def process(self, handler_input, response):
         # type: (HandlerInput, Response) -> None
-        persistent_attributes = handler_input.attributes_manager.persistent_attributes
-        session_attributes = handler_input.attributes_manager.session_attributes
-
-        persistent_attributes["visits"] = session_attributes["visits"]
-        handler_input.attributes_manager.save_persistent_attributes()
+        logger.debug('----- RESPONSE -----')
+        logger.debug("{}".format(response))
 
 
 # The SkillBuilder object acts as the entry point for your skill, routing all request and response
@@ -198,6 +305,9 @@ sb = StandardSkillBuilder(
     table_name=os.environ.get("DYNAMODB_PERSISTENCE_TABLE_NAME"), auto_create_table=False)
 
 sb.add_request_handler(LaunchRequestHandler())
+sb.add_request_handler(YesIntentHandler())
+sb.add_request_handler(PhoneNumberIntentHandler())
+sb.add_request_handler(CodeIntentHandler())
 sb.add_request_handler(LunchReadyIntentHandler())
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
@@ -207,8 +317,7 @@ sb.add_request_handler(IntentReflectorHandler()) # make sure IntentReflectorHand
 
 sb.add_exception_handler(CatchAllExceptionHandler())
 
-# Interceptors
-sb.add_global_request_interceptor(LoadDataInterceptor())
-sb.add_global_response_interceptor(SaveDataInterceptor())
+#sb.add_global_request_interceptor(LoggingRequestInterceptor())
+#sb.add_global_response_interceptor(LoggingResponseInterceptor())
 
 lambda_handler = sb.lambda_handler()
